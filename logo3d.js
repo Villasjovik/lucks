@@ -29,6 +29,40 @@ function mkSparks(scene) {
     geo.attributes.position.needsUpdate=true;geo.attributes.alpha.needsUpdate=true;};
 }
 
+// Each hero has one floor, owned by Villa Sjövik. Use layout CSS pixels before
+// shared entrance/scroll transforms; world Y alone cannot align different canvases.
+const heroFloors = new WeakMap();
+function registerHeroLogo(container, entry) {
+  const hero = container.closest('.h-lockup');
+  if (!hero) return () => {};
+  let group = heroFloors.get(hero);
+  if (!group) {
+    group = { entries: [], frame: 0 };
+    group.schedule = () => {
+      if (group.frame) return;
+      group.frame = requestAnimationFrame(() => {
+        group.frame = 0;
+        const reference = group.entries.find(e => e.container.matches('.hero-logo-vs'));
+        if (!reference?.ready()) return;
+        reference.fit();
+        const limit = reference.projectedSize();
+        const floor = reference.floorY();
+        for (const logo of group.entries) {
+          if (logo === reference || !logo.ready()) continue;
+          logo.fit(limit);
+          logo.alignFloor(floor);
+        }
+      });
+    };
+    heroFloors.set(hero, group);
+    // Reproject after entrance transforms and responsive layout changes as well.
+    hero.addEventListener('transitionend', group.schedule);
+    window.addEventListener('resize', group.schedule, { passive: true });
+  }
+  group.entries.push({ container, ...entry });
+  return group.schedule;
+}
+
 /* ── MAIN ────────────────────────────────────── */
 function initLogo3D(container) {
   const svgPath = container.dataset.svg;
@@ -41,7 +75,8 @@ function initLogo3D(container) {
   const rotDelay = parseFloat(container.dataset.delay || '0');
   const nudgeX = parseFloat(container.dataset.nudgeX || '0');
   const yOffset = parseFloat(container.dataset.yOffset || '0');
-  const shadowYAbs = container.dataset.shadowY; // absolute Y for shadow (overrides auto)
+  // Legacy overrides remain available outside grouped heroes only.
+  const shadowYAbs = container.closest('.h-lockup') ? null : container.dataset.shadowY;
   const mode = container.dataset.mode || 'spin';
   const isTilt = mode === 'tilt';
   const motion = container.dataset.motion || 'default'; // 'default' | 'float-spin'
@@ -61,8 +96,11 @@ function initLogo3D(container) {
   const renderer = new THREE.WebGLRenderer({ antialias:true, alpha:isTransparent, powerPreference:IS_MOBILE?'low-power':'high-performance' });
   renderer.setSize(W, H);
   renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-  renderer.toneMapping = THREE.ACESFilmicToneMapping;
-  renderer.toneMappingExposure = 1.3;
+  // Opt-in per container (2026-09-17, HECHT): mättade märkesfärger (rött) bleks till korall under ACES 1.3.
+  // data-tone="neutral" + data-exposure håller färgen; utan attributen gäller ACES 1.3 som tidigare.
+  const TONE = { aces: THREE.ACESFilmicToneMapping, neutral: THREE.NeutralToneMapping, agx: THREE.AgXToneMapping, none: THREE.NoToneMapping };
+  renderer.toneMapping = TONE[container.dataset.tone] ?? THREE.ACESFilmicToneMapping;
+  renderer.toneMappingExposure = parseFloat(container.dataset.exposure || "1.3");
   if (isTransparent) renderer.setClearColor(0x000000, 0);
   container.appendChild(renderer.domElement);
 
@@ -140,6 +178,8 @@ function initLogo3D(container) {
 
   const updSparks = hasSparks ? mkSparks(scene) : null;
   let logoBox = null;
+  let fittedSize = null;
+  let refitLogo = null; // set in load-callback; re-called on container resize so the fit follows vw-based containers
   let rotAngle = 0;
   let elapsed = 0;
 
@@ -173,6 +213,32 @@ function initLogo3D(container) {
     scene.add(shadowPlane);
   }
 
+  const viewHeight = () => 2 * Math.tan(camera.fov * Math.PI / 360) * camera.position.z;
+  const hero = container.closest('.h-lockup');
+  const layoutTop = () => {
+    let top = 0;
+    for (let el = container; el && el !== hero; el = el.offsetParent) top += el.offsetTop;
+    return top;
+  };
+  const scheduleHeroFit = registerHeroLogo(container, {
+    ready: () => !!refitLogo && !!logoBox,
+    fit: limit => refitLogo(limit),
+    projectedSize: () => {
+      const px = container.clientHeight / viewHeight();
+      return { w: fittedSize.x * px, h: fittedSize.y * px,
+        spin: Math.hypot(fittedSize.x, fittedSize.z) * px };
+    },
+    floorY: () => {
+      const y = shadowPlane?.position.y ?? (-logoBox.h / 2 - 50 + yOffset);
+      return layoutTop() + (0.5 - y / viewHeight()) * container.clientHeight;
+    },
+    alignFloor: floor => {
+      if (!shadowPlane) return;
+      const height = container.clientHeight;
+      if (height) shadowPlane.position.y = (0.5 - (floor - layoutTop()) / height) * viewHeight();
+    }
+  });
+
   const useColorFromSvg = container.dataset.useSvgColor === 'true';
 
   new SVGLoader().load(svgPath, (data) => {
@@ -203,7 +269,9 @@ function initLogo3D(container) {
         // Anti-Z-fighting: lyft varje path 0.5 units framåt baserat på path-ordning
         // SVGLoader returnerar paths i SVG-dokumentordning, så senare paths (vit "e", svart text)
         // hamnar visuellt framför tidigare (röd kvadrat-bakgrund)
-        mesh.position.z = pathIdx * 0.5;
+        // Opt-in per container (womanswork 2026-09-30): data-layer-gap lyfter varje path över föregående,
+        // så text på en 3D-platta inte z-fightar mot plattans framsida. Default 0.5 = tidigare beteende.
+        mesh.position.z = pathIdx * (parseFloat(container.dataset.layerGap) || 0.5);
         mesh.renderOrder = pathIdx;
         logo.add(mesh);
       }
@@ -220,27 +288,48 @@ function initLogo3D(container) {
     // Now center is at origin. Apply Y-flip + scale.
     const rawSize = rawBox.getSize(new THREE.Vector3());
 
-    const vFOV = camera.fov * Math.PI / 180;
-    const visH = 2 * Math.tan(vFOV / 2) * camera.position.z;
-    const visW = visH * camera.aspect;
+    // REFIT (2026-08-26, maxifleur): scale-beräkningen bor i en idempotent refit() som även körs
+    // från ResizeObservern. Innan låg den bara i load-callbacken — s beräknades EN gång från
+    // containerns init-mått, så när en vw-baserad container krympte (fönster-resize, rotation,
+    // devtools) behöll loggan sin world-storlek och klipptes av canvas-kanten ("Maxifl…").
+    refitLogo = (limit = null) => {
+      const vFOV = camera.fov * Math.PI / 180;
+      const visH = 2 * Math.tan(vFOV / 2) * camera.position.z;
+      const visW = visH * camera.aspect;
 
-    // Generous margin: logo must fit at all rotation angles
-    const diagW = Math.sqrt(rawSize.x * rawSize.x + depth * depth);
-    // Aspect-aware fill: wide logos get more margin
-    const aspect = rawSize.x / rawSize.y; // >1 = wide, <1 = tall
-    const fillW = aspect > 2 ? 0.52 : 0.65; // wide logos like NUURA get smaller fill
-    const fillH = 0.70;
-    const s = Math.min((visW * fillW) / diagW, (visH * fillH) / rawSize.y);
+      // Generous margin: logo must fit at all rotation angles
+      const diagW = Math.sqrt(rawSize.x * rawSize.x + depth * depth);
+      // Aspect-aware fill: wide logos get more margin
+      const aspect = rawSize.x / rawSize.y; // >1 = wide, <1 = tall
+      // Ultra-wide lockups (Maxifleur 4.79) get an extra safety tier so full spin + perspektiv
+      // aldrig kan nå canvas-kanten
+      const fillW = aspect > 4 ? 0.48 : aspect > 2 ? 0.52 : 0.65;
+      const fillH = 0.70;
+      let s = Math.min((visW * fillW) / diagW, (visH * fillH) / rawSize.y);
+      if (limit) {
+        const px = container.clientHeight / visH;
+        if (px > 0) s = Math.min(s, limit.w / (rawSize.x * px),
+          limit.h / (rawSize.y * px), limit.spin / (Math.hypot(rawSize.x, rawSize.z) * px));
+      }
 
-    logo.scale.set(s, -s, s); // -s flips Y for SVG coords
+      logo.position.set(0, 0, 0); // geometry was centered before joining the animated pivot
+      logo.scale.set(s, -s, s); // -s flips Y for SVG coords
 
-    // Verify center is still at origin after scale
-    const finalBox = new THREE.Box3().setFromObject(logo);
-    const drift = finalBox.getCenter(new THREE.Vector3());
-    logo.position.sub(drift);
+      const fSize = rawSize.clone().multiplyScalar(s);
+      fittedSize = fSize;
+      logoBox = { w: fSize.x, h: fSize.y };
 
-    const fSize = finalBox.getSize(new THREE.Vector3());
-    logoBox = { w: fSize.x, h: fSize.y };
+      // Villa Sjövik defines the hero floor from its own fitted silhouette.
+      // The coordinator projects that floor into each customer's camera.
+      if (shadowPlane) {
+        shadowPlane.position.y = shadowYAbs != null
+          ? parseFloat(shadowYAbs)
+          : -fSize.y / 2 - 50 + yOffset;
+        // scale width to match logo, keep height proportional
+        shadowPlane.scale.set(fSize.x / 380, 1, 1);
+      }
+    };
+    refitLogo();
 
     // Cast shadow for all meshes in logo
     if (hasShadow) {
@@ -248,17 +337,7 @@ function initLogo3D(container) {
     }
 
     pivot.add(logo);
-
-    // Position shadow plane
-    // If data-shadow-y is set, use absolute Y (aligns shadows across multiple logos)
-    // Otherwise auto: far below logo bottom so logo doesn't sit in its own shadow
-    if (shadowPlane) {
-      shadowPlane.position.y = shadowYAbs != null
-        ? parseFloat(shadowYAbs)
-        : -fSize.y / 2 - 50 + yOffset;
-      // scale width to match logo, keep height proportional
-      shadowPlane.scale.set(fSize.x / 380, 1, 1);
-    }
+    scheduleHeroFit();
   },
   undefined, // onProgress
   (err) => {
@@ -372,6 +451,8 @@ function initLogo3D(container) {
     camera.aspect = w / h;
     camera.updateProjectionMatrix();
     renderer.setSize(w, h);
+    if (refitLogo) refitLogo();
+    scheduleHeroFit(); // refit reference first, then cap and align its siblings
   }).observe(container);
 }
 
